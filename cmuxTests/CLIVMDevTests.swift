@@ -231,7 +231,9 @@ extension CLINotifyProcessIntegrationRegressionTests {
             Case(name: "cargo", files: ["Cargo.toml": "[package]\nname = \"app\"\n"], extra: [], command: "cargo run", port: nil, kind: "cargo", sync: true),
             Case(name: "go", files: ["go.mod": "module app\n"], extra: [], command: "go run .", port: nil, kind: "go", sync: true),
             Case(name: "make", files: ["Makefile": ".PHONY: dev\nbuild:\n\techo build\ndev: build\n\techo dev\n"], extra: [], command: "make dev", port: nil, kind: "make", sync: true),
-            Case(name: "make-without-dev", files: ["Makefile": "development:\n\techo x\n", "manage.py": "# django"], extra: [], command: "python manage.py runserver 0.0.0.0:8000", port: 8000, kind: "django", sync: true),
+            Case(name: "make-without-dev", files: ["Makefile": "development:\n\techo x\n", "manage.py": "# django"], extra: [], command: "python manage.py runserver 127.0.0.1:8000", port: 8000, kind: "django", sync: true),
+            Case(name: "django", files: ["manage.py": "# django"], extra: [], command: "python manage.py runserver 127.0.0.1:8000", port: 8000, kind: "django", sync: true),
+            Case(name: "django-external-bind", files: ["manage.py": "# django"], extra: ["--allow-external-bind"], command: "python manage.py runserver 0.0.0.0:8000", port: 8000, kind: "django", sync: true),
             Case(name: "uv", files: ["pyproject.toml": "[project]\nname = \"app\"\n", "uv.lock": ""], extra: [], command: "uv sync", port: nil, kind: "uv", sync: true),
             Case(name: "static", files: ["index.html": "<h1>hi</h1>"], extra: [], command: "python3 -m http.server 8000", port: 8000, kind: "static", sync: true),
             Case(name: "empty", files: ["notes.txt": "nothing to run"], extra: [], command: nil, port: nil, kind: "none", sync: true),
@@ -297,6 +299,39 @@ extension CLINotifyProcessIntegrationRegressionTests {
                 let surfaces = ((node?["pane"] as? [String: Any])?["surfaces"] as? [[String: Any]]) ?? []
                 XCTAssertEqual(surfaces.map { $0["name"] as? String }, ["shell"], testCase.name)
             }
+        }
+    }
+
+    /// The security property the fix is about: loopback is the default, and the only way to
+    /// get `0.0.0.0` is an explicit opt-in that prints what it costs on stderr.
+    func testVMDevDjangoBindsLoopbackUnlessTheExternalBindOptInIsGiven() throws {
+        let fixture = try vmDevFixture("django", files: ["manage.py": "# django"])
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let cliPath = try bundledCLIPath()
+        func dryRun(_ name: String, extra: [String]) throws -> ProcessRunResult {
+            let environment = vmDevEnvironment(socketPath: makeSocketPath("vm-dev-django-\(name)"), home: fixture.home)
+            let result = runProcess(
+                executablePath: cliPath,
+                arguments: ["vm", "dev", "brave-otter", fixture.project.path, "--dry-run"] + extra,
+                environment: environment,
+                timeout: 30
+            )
+            XCTAssertFalse(result.timedOut, "\(name) timed out")
+            XCTAssertEqual(result.status, 0, "\(name): stdout=\(result.stdout) stderr=\(result.stderr)")
+            return result
+        }
+
+        let defaultRun = try dryRun("default", extra: [])
+        XCTAssertTrue(defaultRun.stdout.contains("dev: python manage.py runserver 127.0.0.1:8000"), defaultRun.stdout)
+        XCTAssertFalse(defaultRun.stdout.contains("0.0.0.0"), "the default plan must not bind every interface:\n\(defaultRun.stdout)")
+        XCTAssertFalse(defaultRun.stderr.contains("--allow-external-bind"), defaultRun.stderr)
+
+        let optedIn = try dryRun("opt-in", extra: ["--allow-external-bind"])
+        XCTAssertTrue(optedIn.stdout.contains("dev: python manage.py runserver 0.0.0.0:8000"), optedIn.stdout)
+        // The warning says the binding is public and that the server has neither
+        // authentication nor CSRF protection.
+        for expected in ["--allow-external-bind", "0.0.0.0:8000", "no authentication", "no CSRF protection", "/admin/"] {
+            XCTAssertTrue(optedIn.stderr.contains(expected), "opt-in stderr should mention '\(expected)':\n\(optedIn.stderr)")
         }
     }
 
