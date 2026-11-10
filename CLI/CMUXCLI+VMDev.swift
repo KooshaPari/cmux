@@ -36,7 +36,7 @@ extension CMUXCLI {
                            script, else the framework default: next/nuxt/react-scripts 3000,
                            vite/svelte-kit/remix 5173, astro 4321, ng 4200, expo 8081, wrangler 8787)
           Cargo.toml       cargo run                       go.mod         go run .
-          Makefile (dev:)  make dev                        manage.py      python manage.py runserver 0.0.0.0:8000  (8000)
+          Makefile (dev:)  make dev                        manage.py      python manage.py runserver 127.0.0.1:8000  (8000)
           uv.lock          uv sync                         pyproject.toml pip install -e .
           requirements.txt pip install -r requirements.txt index.html     python3 -m http.server 8000  (8000)
           nothing          shell pane only (pass --command to run something anyway)
@@ -51,6 +51,12 @@ extension CMUXCLI {
           --remote <path>      Where the folder lives on the machine (default work/<basename>).
           --sync | --no-sync   Push the folder first. Default: on when a folder is named or a project
                                was detected; off for a folder with nothing recognizable in it.
+          --allow-external-bind
+                               Bind a detected Django dev server on 0.0.0.0 instead of 127.0.0.1.
+                               Opt-in only: Django's dev server has no authentication and no CSRF
+                               protection, so /admin/ and every ORM-backed view are reachable by
+                               anything that can route to the machine. Only the loopback default is
+                               safe on an untrusted network.
           --no-open            Build on the machine only; print the open command instead.
           --dry-run            Print the plan (detection, remote path, layout) without touching anything.
           --json               {machine, workspace_id, local_workspace_id, workspace_name, existing, local,
@@ -112,7 +118,10 @@ extension CMUXCLI {
         ("wrangler", 8787),
     ]
 
-    static func detectVMDevProject(in directory: URL) -> VMDevDetection {
+    /// `allowExternalBind` is the opt-in for the one project family whose dev server
+    /// would otherwise be unusable through the machine's port proxy. It only ever
+    /// affects the Django branch; every other family is unchanged.
+    static func detectVMDevProject(in directory: URL, allowExternalBind: Bool = false) -> VMDevDetection {
         let fm = FileManager.default
         func exists(_ name: String) -> Bool { fm.fileExists(atPath: directory.appendingPathComponent(name).path) }
 
@@ -131,9 +140,12 @@ extension CMUXCLI {
             return VMDevDetection(kind: "make", command: "make dev", port: nil, detail: "Makefile has a dev target → make dev")
         }
         if exists("manage.py") {
-            // 0.0.0.0, not the runserver default of 127.0.0.1: the machine's port proxy
-            // reaches the process from outside the loopback interface.
-            return VMDevDetection(kind: "django", command: "python manage.py runserver 0.0.0.0:8000", port: 8000, detail: "manage.py → Django runserver on 8000")
+            // 127.0.0.1, Django's own default, because its dev server has no authentication
+            // and no CSRF protection: binding every interface publishes /admin/ and every
+            // ORM-backed view to whatever can route to the machine. --allow-external-bind
+            // is the explicit opt-in for a machine reachable only over a trusted tunnel.
+            let bindHost = allowExternalBind ? "0.0.0.0" : "127.0.0.1"
+            return VMDevDetection(kind: "django", command: "python manage.py runserver \(bindHost):8000", port: 8000, detail: "manage.py → Django runserver on \(bindHost):8000")
         }
         if exists("uv.lock") {
             return VMDevDetection(kind: "uv", command: "uv sync", port: nil, detail: "uv.lock → uv sync prepares the environment; start the app from the shell pane with `uv run <command>`")
@@ -356,6 +368,7 @@ extension CMUXCLI {
         var port: Int?
         var remote: String?
         var sync: Bool?
+        var allowExternalBind = false
         var noOpen = false
         var dryRun = false
     }
@@ -394,6 +407,7 @@ extension CMUXCLI {
                 options.port = port
             case "--sync": options.sync = true
             case "--no-sync": options.sync = false
+            case "--allow-external-bind": options.allowExternalBind = true
             case "--no-open": options.noOpen = true
             case "--dry-run": options.dryRun = true
             case "--json": break
@@ -443,7 +457,12 @@ extension CMUXCLI {
         let workspaceName = options.name ?? basename
         let remote = options.remote ?? "work/\(basename)"
 
-        let detection = Self.detectVMDevProject(in: localURL)
+        let detection = Self.detectVMDevProject(in: localURL, allowExternalBind: options.allowExternalBind)
+        // The opt-in is honoured only where it applies, and it says out loud what it costs:
+        // the binding is public on the machine and the server has no auth and no CSRF guard.
+        if options.allowExternalBind, detection.kind == "django", options.command == nil {
+            cliWriteStderr("warning: --allow-external-bind binds Django's dev server on 0.0.0.0:8000. That server has no authentication and no CSRF protection, so /admin/ and every ORM-backed view are reachable, unauthenticated and CSRF-writeable, by anything that can route to this machine. Keep it to a machine reachable only over a trusted tunnel.\n")
+        }
         let command = options.command ?? detection.command
         let port: Int?
         if let explicit = options.port {
